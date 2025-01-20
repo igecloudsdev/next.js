@@ -1,6 +1,6 @@
 import os from 'os'
 import path from 'path'
-import { existsSync, promises as fs } from 'fs'
+import { existsSync, promises as fs, rmSync } from 'fs'
 import treeKill from 'tree-kill'
 import type { NextConfig } from 'next'
 import { FileRef, isNextDeploy } from '../e2e-utils'
@@ -23,8 +23,12 @@ export type PackageJson = {
   dependencies?: { [key: string]: string }
   [key: string]: unknown
 }
+
+type ResolvedFileConfig = FileRef | { [filename: string]: string | FileRef }
+type FilesConfig = ResolvedFileConfig | string
 export interface NextInstanceOpts {
-  files: FileRef | string | { [filename: string]: string | FileRef }
+  files: FilesConfig
+  overrideFiles?: FilesConfig
   dependencies?: { [name: string]: string }
   resolutions?: { [name: string]: string }
   packageJson?: PackageJson
@@ -36,6 +40,8 @@ export interface NextInstanceOpts {
   dirSuffix?: string
   turbo?: boolean
   forcedPort?: string
+  serverReadyPattern?: RegExp
+  patchFileDelay?: number
 }
 
 /**
@@ -48,8 +54,13 @@ type OmitFirstArgument<F> = F extends (
   ? (...args: P) => R
   : never
 
+// Do not rename or format. sync-react script relies on this line.
+// prettier-ignore
+const nextjsReactPeerVersion = "^19.0.0";
+
 export class NextInstance {
-  protected files: FileRef | { [filename: string]: string | FileRef }
+  protected files: ResolvedFileConfig
+  protected overrideFiles: ResolvedFileConfig
   protected nextConfig?: NextConfig
   protected installCommand?: InstallCommand
   protected buildCommand?: string
@@ -58,6 +69,7 @@ export class NextInstance {
   protected resolutions?: PackageJson['resolutions']
   protected events: { [eventName: string]: Set<any> } = {}
   public testDir: string
+  tmpRepoDir: string
   protected isStopping: boolean = false
   protected isDestroyed: boolean = false
   protected childProcess?: ChildProcess
@@ -68,12 +80,12 @@ export class NextInstance {
   public env: Record<string, string>
   public forcedPort?: string
   public dirSuffix: string = ''
+  public serverReadyPattern?: RegExp = / ✓ Ready in /
+  patchFileDelay: number = 0
 
   constructor(opts: NextInstanceOpts) {
     this.env = {}
     Object.assign(this, opts)
-
-    require('console').log('packageJson??', this.packageJson)
 
     if (!isNextDeploy) {
       this.env = {
@@ -89,10 +101,10 @@ export class NextInstance {
     }
   }
 
-  protected async writeInitialFiles() {
+  private async writeFiles(filesConfig: FilesConfig, testDir: string) {
     // Handle case where files is a directory string
     const files =
-      typeof this.files === 'string' ? new FileRef(this.files) : this.files
+      typeof filesConfig === 'string' ? new FileRef(filesConfig) : filesConfig
     if (files instanceof FileRef) {
       // if a FileRef is passed directly to `files` we copy the
       // entire folder to the test directory
@@ -104,7 +116,7 @@ export class NextInstance {
         )
       }
 
-      await fs.cp(files.fsPath, this.testDir, {
+      await fs.cp(files.fsPath, testDir, {
         recursive: true,
         filter(source) {
           // we don't copy a package.json as it's manually written
@@ -118,7 +130,7 @@ export class NextInstance {
     } else {
       for (const filename of Object.keys(files)) {
         const item = files[filename]
-        const outputFilename = path.join(this.testDir, filename)
+        const outputFilename = path.join(testDir, filename)
 
         if (typeof item === 'string') {
           await fs.mkdir(path.dirname(outputFilename), { recursive: true })
@@ -127,6 +139,16 @@ export class NextInstance {
           await fs.cp(item.fsPath, outputFilename, { recursive: true })
         }
       }
+    }
+  }
+
+  protected async writeInitialFiles() {
+    return this.writeFiles(this.files, this.testDir)
+  }
+
+  protected async writeOverrideFiles() {
+    if (this.overrideFiles) {
+      return this.writeFiles(this.overrideFiles, this.testDir)
     }
   }
 
@@ -161,7 +183,7 @@ export class NextInstance {
         )
 
         const reactVersion =
-          process.env.NEXT_TEST_REACT_VERSION || '19.0.0-rc.0'
+          process.env.NEXT_TEST_REACT_VERSION || nextjsReactPeerVersion
         const finalDependencies = {
           react: reactVersion,
           'react-dom': reactVersion,
@@ -214,16 +236,17 @@ export class NextInstance {
               recursive: true,
             })
           } else {
-            const { installDir } = await createNextInstall({
+            const { installDir, tmpRepoDir } = await createNextInstall({
               parentSpan: rootSpan,
               dependencies: finalDependencies,
               resolutions: this.resolutions ?? null,
               installCommand: this.installCommand,
               packageJson: this.packageJson,
               dirSuffix: this.dirSuffix,
-              keepRepoDir: Boolean(process.env.NEXT_TEST_SKIP_CLEANUP),
+              keepRepoDir: true,
             })
             this.testDir = installDir
+            this.tmpRepoDir = tmpRepoDir
           }
           require('console').log('created next.js install, writing test files')
         }
@@ -232,6 +255,12 @@ export class NextInstance {
           .traceChild('writeInitialFiles')
           .traceAsyncFn(async () => {
             await this.writeInitialFiles()
+          })
+
+        await rootSpan
+          .traceChild('writeOverrideFiles')
+          .traceAsyncFn(async () => {
+            await this.writeOverrideFiles()
           })
 
         const testDirFiles = await fs.readdir(this.testDir)
@@ -334,6 +363,19 @@ export class NextInstance {
       })
   }
 
+  protected setServerReadyTimeout(
+    reject: (reason?: unknown) => void,
+    ms = 10_000
+  ): NodeJS.Timeout {
+    return setTimeout(() => {
+      reject(
+        new Error(
+          `Failed to start server after ${ms}ms, waiting for this log pattern: ${this.serverReadyPattern}`
+        )
+      )
+    }, ms)
+  }
+
   // normalize snapshots or stack traces being tested
   // to a consistent test dir value since it's random
   public normalizeTestDirContent(content) {
@@ -379,20 +421,29 @@ export class NextInstance {
 
   public async start(useDirArg: boolean = false): Promise<void> {}
 
-  public async stop(): Promise<void> {
+  public async stop(
+    signal: 'SIGINT' | 'SIGTERM' | 'SIGKILL' = 'SIGKILL'
+  ): Promise<void> {
     if (this.childProcess) {
+      if (this.isStopping) {
+        // warn for debugging, but don't prevent sending two signals in succession
+        // (e.g. SIGINT and then SIGKILL)
+        require('console').error(
+          `Next server is already being stopped (received signal: ${signal})`
+        )
+      }
       this.isStopping = true
-      const exitPromise = once(this.childProcess, 'exit')
+      const closePromise = once(this.childProcess, 'close')
       await new Promise<void>((resolve) => {
-        treeKill(this.childProcess.pid, 'SIGKILL', (err) => {
+        treeKill(this.childProcess.pid, signal, (err) => {
           if (err) {
             require('console').error('tree-kill', err)
           }
           resolve()
         })
       })
-      this.childProcess.kill('SIGKILL')
-      await exitPromise
+      this.childProcess.kill(signal)
+      await closePromise
       this.childProcess = undefined
       this.isStopping = false
       require('console').log(`Stopped next server`)
@@ -401,6 +452,8 @@ export class NextInstance {
 
   public async destroy(): Promise<void> {
     try {
+      require('console').time('destroyed next instance')
+
       if (this.isDestroyed) {
         throw new Error(`next instance already destroyed`)
       }
@@ -431,9 +484,13 @@ export class NextInstance {
       }
 
       if (!process.env.NEXT_TEST_SKIP_CLEANUP) {
-        await fs.rm(this.testDir, { recursive: true, force: true })
+        // Faster than `await fs.rm`. Benchmark before change.
+        rmSync(this.testDir, { recursive: true, force: true })
+        if (this.tmpRepoDir) {
+          rmSync(this.tmpRepoDir, { recursive: true, force: true })
+        }
       }
-      require('console').log(`destroyed next instance`)
+      require('console').timeEnd(`destroyed next instance`)
     } catch (err) {
       require('console').error('Error while destroying', err)
     }
@@ -470,27 +527,46 @@ export class NextInstance {
     )
   }
 
+  public async remove(fileOrDirPath: string) {
+    await fs.rm(path.join(this.testDir, fileOrDirPath), {
+      recursive: true,
+      force: true,
+    })
+  }
+
   public async patchFile(
     filename: string,
-    content: string | ((contents: string) => string)
+    content: string | ((content: string) => string),
+    runWithTempContent?: (context: { newFile: boolean }) => Promise<void>
   ): Promise<{ newFile: boolean }> {
     const outputPath = path.join(this.testDir, filename)
     const newFile = !existsSync(outputPath)
     await fs.mkdir(path.dirname(outputPath), { recursive: true })
+    const previousContent = newFile ? undefined : await this.readFile(filename)
 
     await fs.writeFile(
       outputPath,
-      typeof content === 'function'
-        ? content(await this.readFile(filename))
-        : content
+      typeof content === 'function' ? content(previousContent) : content,
+      {
+        flush: true,
+      }
     )
 
-    return { newFile }
-  }
+    if (runWithTempContent) {
+      try {
+        await runWithTempContent({ newFile })
+      } finally {
+        if (previousContent === undefined) {
+          await fs.rm(outputPath)
+        } else {
+          await fs.writeFile(outputPath, previousContent, {
+            flush: true,
+          })
+        }
+      }
+    }
 
-  public async patchFileFast(filename: string, content: string) {
-    const outputPath = path.join(this.testDir, filename)
-    await fs.writeFile(outputPath, content)
+    return { newFile }
   }
 
   public async renameFile(filename: string, newFilename: string) {
@@ -571,5 +647,12 @@ export class NextInstance {
     this.events[event]?.forEach((cb) => {
       cb(...args)
     })
+  }
+
+  public getCliOutputFromHere() {
+    const length = this.cliOutput.length
+    return () => {
+      return this.cliOutput.slice(length)
+    }
   }
 }

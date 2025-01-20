@@ -13,14 +13,13 @@ import {
   AppRouterContext,
   LayoutRouterContext,
   GlobalLayoutRouterContext,
-  MissingSlotContext,
 } from '../../shared/lib/app-router-context.shared-runtime'
 import type {
   CacheNode,
   AppRouterInstance,
 } from '../../shared/lib/app-router-context.shared-runtime'
 import {
-  ACTION_FAST_REFRESH,
+  ACTION_HMR_REFRESH,
   ACTION_NAVIGATE,
   ACTION_PREFETCH,
   ACTION_REFRESH,
@@ -40,13 +39,12 @@ import {
   PathnameContext,
   PathParamsContext,
 } from '../../shared/lib/hooks-client-context.shared-runtime'
+import { useReducer, useUnwrapState } from './use-reducer'
 import {
-  useReducerWithReduxDevtools,
-  useUnwrapState,
-  type ReduxDevtoolsSyncFn,
-} from './use-reducer-with-devtools'
-import { ErrorBoundary } from './error-boundary'
-import { createInitialRouterState } from './router-reducer/create-initial-router-state'
+  ErrorBoundary,
+  type ErrorComponent,
+  type GlobalErrorComponent,
+} from './error-boundary'
 import { isBot } from '../../shared/lib/router/utils/is-bot'
 import { addBasePath } from '../add-base-path'
 import { AppRouterAnnouncer } from './app-router-announcer'
@@ -56,17 +54,13 @@ import { unresolvedThenable } from './unresolved-thenable'
 import { removeBasePath } from '../remove-base-path'
 import { hasBasePath } from '../has-base-path'
 import { getSelectedParams } from './router-reducer/compute-changed-path'
-import type {
-  FlightRouterState,
-  InitialRSCPayload,
-} from '../../server/app-render/types'
+import type { FlightRouterState } from '../../server/app-render/types'
+import { useNavFailureHandler } from './nav-failure-handler'
 import { useServerActionDispatcher } from '../app-call-server'
-const isServer = typeof window === 'undefined'
-
-// Ensure the initialParallelRoutes are not combined because of double-rendering in the browser with Strict Mode.
-let initialParallelRoutes: CacheNode['parallelRoutes'] = isServer
-  ? null!
-  : new Map()
+import type { AppRouterActionQueue } from '../../shared/lib/router/action-queue'
+import { prefetch as prefetchWithSegmentCache } from '../components/segment-cache/prefetch'
+import { getRedirectTypeFromError, getURLFromRedirectError } from './redirect'
+import { isRedirectError, RedirectType } from './redirect-error'
 
 const globalMutable: {
   pendingMpaPath?: string
@@ -76,14 +70,55 @@ function isExternalURL(url: URL) {
   return url.origin !== window.location.origin
 }
 
+/**
+ * Given a link href, constructs the URL that should be prefetched. Returns null
+ * in cases where prefetching should be disabled, like external URLs, or
+ * during development.
+ * @param href The href passed to <Link>, router.prefetch(), or similar
+ * @returns A URL object to prefetch, or null if prefetching should be disabled
+ */
+export function createPrefetchURL(href: string): URL | null {
+  // Don't prefetch for bots as they don't navigate.
+  if (isBot(window.navigator.userAgent)) {
+    return null
+  }
+
+  let url: URL
+  try {
+    url = new URL(addBasePath(href), window.location.href)
+  } catch (_) {
+    // TODO: Does this need to throw or can we just console.error instead? Does
+    // anyone rely on this throwing? (Seems unlikely.)
+    throw new Error(
+      `Cannot prefetch '${href}' because it cannot be converted to a URL.`
+    )
+  }
+
+  // Don't prefetch during development (improves compilation performance)
+  if (process.env.NODE_ENV === 'development') {
+    return null
+  }
+
+  // External urls can't be prefetched in the same way.
+  if (isExternalURL(url)) {
+    return null
+  }
+
+  return url
+}
+
 function HistoryUpdater({
   appRouterState,
-  sync,
 }: {
   appRouterState: AppRouterState
-  sync: ReduxDevtoolsSyncFn
 }) {
   useInsertionEffect(() => {
+    if (process.env.__NEXT_APP_NAV_FAIL_HANDLING) {
+      // clear pending URL as navigation is no longer
+      // in flight
+      window.next.__pendingUrl = undefined
+    }
+
     const { tree, pushRef, canonicalUrl } = appRouterState
     const historyState = {
       ...(pushRef.preserveCustomHistoryState ? window.history.state : {}),
@@ -105,9 +140,7 @@ function HistoryUpdater({
     } else {
       window.history.replaceState(historyState, '', canonicalUrl)
     }
-
-    sync(appRouterState)
-  }, [appRouterState, sync])
+  }, [appRouterState])
   return null
 }
 
@@ -148,6 +181,10 @@ function useNavigate(dispatch: React.Dispatch<ReducerActions>): RouterNavigate {
     (href, navigateType, shouldScroll) => {
       const url = new URL(addBasePath(href), location.href)
 
+      if (process.env.__NEXT_APP_NAV_FAIL_HANDLING) {
+        window.next.__pendingUrl = url
+      }
+
       return dispatch({
         type: ACTION_NAVIGATE,
         url,
@@ -155,6 +192,7 @@ function useNavigate(dispatch: React.Dispatch<ReducerActions>): RouterNavigate {
         locationSearch: location.search,
         shouldScroll: shouldScroll ?? true,
         navigateType,
+        allowAliasing: true,
       })
     },
     [dispatch]
@@ -206,40 +244,16 @@ function Head({
  * The global router that wraps the application components.
  */
 function Router({
-  initialRSCPayload,
+  actionQueue,
+  assetPrefix,
+  globalError,
 }: {
-  initialRSCPayload: Omit<InitialRSCPayload, 'G'>
+  actionQueue: AppRouterActionQueue
+  assetPrefix: string
+  globalError: [GlobalErrorComponent, React.ReactNode]
 }) {
-  const initialState = useMemo(
-    () =>
-      createInitialRouterState({
-        buildId: initialRSCPayload.b,
-        initialSeedData: initialRSCPayload.d,
-        initialCanonicalUrl: initialRSCPayload.c,
-        initialTree: initialRSCPayload.t,
-        initialParallelRoutes,
-        location: !isServer ? window.location : null,
-        initialHead: initialRSCPayload.h,
-        couldBeIntercepted: initialRSCPayload.i,
-      }),
-    [
-      initialRSCPayload.b,
-      initialRSCPayload.c,
-      initialRSCPayload.t,
-      initialRSCPayload.d,
-      initialRSCPayload.h,
-      initialRSCPayload.i,
-    ]
-  )
-  const [reducerState, dispatch, sync] =
-    useReducerWithReduxDevtools(initialState)
-
-  useEffect(() => {
-    // Ensure initialParallelRoutes is cleaned up from memory once it's used.
-    initialParallelRoutes = null!
-  }, [])
-
-  const { canonicalUrl } = useUnwrapState(reducerState)
+  const [state, dispatch] = useReducer(actionQueue)
+  const { canonicalUrl } = useUnwrapState(state)
   // Add memoized pathname/query for useSearchParams and usePathname.
   const { searchParams, pathname } = useMemo(() => {
     const url = new URL(
@@ -267,38 +281,30 @@ function Router({
     const routerInstance: AppRouterInstance = {
       back: () => window.history.back(),
       forward: () => window.history.forward(),
-      prefetch: (href, options) => {
-        // Don't prefetch for bots as they don't navigate.
-        if (isBot(window.navigator.userAgent)) {
-          return
-        }
-
-        let url: URL
-        try {
-          url = new URL(addBasePath(href), window.location.href)
-        } catch (_) {
-          throw new Error(
-            `Cannot prefetch '${href}' because it cannot be converted to a URL.`
-          )
-        }
-
-        // Don't prefetch during development (improves compilation performance)
-        if (process.env.NODE_ENV === 'development') {
-          return
-        }
-
-        // External urls can't be prefetched in the same way.
-        if (isExternalURL(url)) {
-          return
-        }
-        startTransition(() => {
-          dispatch({
-            type: ACTION_PREFETCH,
-            url,
-            kind: options?.kind ?? PrefetchKind.FULL,
-          })
-        })
-      },
+      prefetch: process.env.__NEXT_CLIENT_SEGMENT_CACHE
+        ? // Unlike the old implementation, the Segment Cache doesn't store its
+          // data in the router reducer state; it writes into a global mutable
+          // cache. So we don't need to dispatch an action.
+          (href, options) =>
+            prefetchWithSegmentCache(
+              href,
+              actionQueue.state.nextUrl,
+              actionQueue.state.tree,
+              options?.kind === PrefetchKind.FULL
+            )
+        : (href, options) => {
+            // Use the old prefetch implementation.
+            const url = createPrefetchURL(href)
+            if (url !== null) {
+              startTransition(() => {
+                dispatch({
+                  type: ACTION_PREFETCH,
+                  url,
+                  kind: options?.kind ?? PrefetchKind.FULL,
+                })
+              })
+            }
+          },
       replace: (href, options = {}) => {
         startTransition(() => {
           navigate(href, 'replace', options.scroll ?? true)
@@ -317,15 +323,15 @@ function Router({
           })
         })
       },
-      fastRefresh: () => {
+      hmrRefresh: () => {
         if (process.env.NODE_ENV !== 'development') {
           throw new Error(
-            'fastRefresh can only be used in development mode. Please use refresh instead.'
+            'hmrRefresh can only be used in development mode. Please use refresh instead.'
           )
         } else {
           startTransition(() => {
             dispatch({
-              type: ACTION_FAST_REFRESH,
+              type: ACTION_HMR_REFRESH,
               origin: window.location.origin,
             })
           })
@@ -334,7 +340,7 @@ function Router({
     }
 
     return routerInstance
-  }, [dispatch, navigate])
+  }, [actionQueue, dispatch, navigate])
 
   useEffect(() => {
     // Exists for debugging purposes. Don't use in application code.
@@ -345,7 +351,7 @@ function Router({
 
   if (process.env.NODE_ENV !== 'production') {
     // eslint-disable-next-line react-hooks/rules-of-hooks
-    const { cache, prefetchCache, tree } = useUnwrapState(reducerState)
+    const { cache, prefetchCache, tree } = useUnwrapState(state)
 
     // This hook is in a conditional but that is ok because `process.env.NODE_ENV` never changes
     // eslint-disable-next-line react-hooks/rules-of-hooks
@@ -394,6 +400,33 @@ function Router({
     }
   }, [dispatch])
 
+  useEffect(() => {
+    // Ensure that any redirect errors that bubble up outside of the RedirectBoundary
+    // are caught and handled by the router.
+    function handleUnhandledRedirect(
+      event: ErrorEvent | PromiseRejectionEvent
+    ) {
+      const error = 'reason' in event ? event.reason : event.error
+      if (isRedirectError(error)) {
+        event.preventDefault()
+        const url = getURLFromRedirectError(error)
+        const redirectType = getRedirectTypeFromError(error)
+        if (redirectType === RedirectType.push) {
+          appRouter.push(url, {})
+        } else {
+          appRouter.replace(url, {})
+        }
+      }
+    }
+    window.addEventListener('error', handleUnhandledRedirect)
+    window.addEventListener('unhandledrejection', handleUnhandledRedirect)
+
+    return () => {
+      window.removeEventListener('error', handleUnhandledRedirect)
+      window.removeEventListener('unhandledrejection', handleUnhandledRedirect)
+    }
+  }, [appRouter])
+
   // When mpaNavigation flag is set do a hard navigation to the new url.
   // Infinitely suspend because we don't actually want to rerender any child
   // components with the new URL and any entangled state updates shouldn't
@@ -404,7 +437,7 @@ function Router({
   // probably safe because we know this is a singleton component and it's never
   // in <Offscreen>. At least I hope so. (It will run twice in dev strict mode,
   // but that's... fine?)
-  const { pushRef } = useUnwrapState(reducerState)
+  const { pushRef } = useUnwrapState(state)
   if (pushRef.mpaNavigation) {
     // if there's a re-render, we don't want to trigger another redirect if one is already in flight to the same URL
     if (globalMutable.pendingMpaPath !== canonicalUrl) {
@@ -497,14 +530,14 @@ function Router({
      * By default dispatches ACTION_RESTORE, however if the history entry was not pushed/replaced by app-router it will reload the page.
      * That case can happen when the old router injected the history entry.
      */
-    const onPopState = ({ state }: PopStateEvent) => {
-      if (!state) {
+    const onPopState = (event: PopStateEvent) => {
+      if (!event.state) {
         // TODO-APP: this case only happens when pushState/replaceState was called outside of Next.js. It should probably reload the page in this case.
         return
       }
 
       // This case happens when the history entry was pushed by the `pages` router.
-      if (!state.__NA) {
+      if (!event.state.__NA) {
         window.location.reload()
         return
       }
@@ -515,7 +548,7 @@ function Router({
         dispatch({
           type: ACTION_RESTORE,
           url: new URL(window.location.href),
-          tree: state.__PRIVATE_NEXTJS_INTERNALS_TREE,
+          tree: event.state.__PRIVATE_NEXTJS_INTERNALS_TREE,
         })
       })
     }
@@ -529,8 +562,7 @@ function Router({
     }
   }, [dispatch])
 
-  const { cache, tree, nextUrl, focusAndScrollRef } =
-    useUnwrapState(reducerState)
+  const { cache, tree, nextUrl, focusAndScrollRef } = useUnwrapState(state)
 
   const matchingHead = useMemo(() => {
     return findHeadInCache(cache, tree[1])
@@ -543,30 +575,23 @@ function Router({
 
   const layoutRouterContext = useMemo(() => {
     return {
-      childNodes: cache.parallelRoutes,
-      tree,
+      parentTree: tree,
+      parentCacheNode: cache,
+      parentSegmentPath: null,
       // Root node always has `url`
       // Provided in AppTreeContext to ensure it can be overwritten in layout-router
       url: canonicalUrl,
-      loading: cache.loading,
     }
-  }, [cache.parallelRoutes, tree, canonicalUrl, cache.loading])
+  }, [tree, cache, canonicalUrl])
 
   const globalLayoutRouterContext = useMemo(() => {
     return {
-      buildId: initialRSCPayload.b,
       changeByServerResponse,
       tree,
       focusAndScrollRef,
       nextUrl,
     }
-  }, [
-    initialRSCPayload.b,
-    changeByServerResponse,
-    tree,
-    focusAndScrollRef,
-    nextUrl,
-  ])
+  }, [changeByServerResponse, tree, focusAndScrollRef, nextUrl])
 
   let head
   if (matchingHead !== null) {
@@ -592,34 +617,27 @@ function Router({
 
   if (process.env.NODE_ENV !== 'production') {
     if (typeof window !== 'undefined') {
-      const DevRootNotFoundBoundary: typeof import('./dev-root-not-found-boundary').DevRootNotFoundBoundary =
-        require('./dev-root-not-found-boundary').DevRootNotFoundBoundary
+      const { DevRootHTTPAccessFallbackBoundary } =
+        require('./dev-root-http-access-fallback-boundary') as typeof import('./dev-root-http-access-fallback-boundary')
       content = (
-        <DevRootNotFoundBoundary>
-          {initialRSCPayload.m ? (
-            <MissingSlotContext.Provider value={initialRSCPayload.m}>
-              {content}
-            </MissingSlotContext.Provider>
-          ) : (
-            content
-          )}
-        </DevRootNotFoundBoundary>
+        <DevRootHTTPAccessFallbackBoundary>
+          {content}
+        </DevRootHTTPAccessFallbackBoundary>
       )
     }
     const HotReloader: typeof import('./react-dev-overlay/app/hot-reloader-client').default =
       require('./react-dev-overlay/app/hot-reloader-client').default
 
     content = (
-      <HotReloader assetPrefix={initialRSCPayload.p}>{content}</HotReloader>
+      <HotReloader assetPrefix={assetPrefix} globalError={globalError}>
+        {content}
+      </HotReloader>
     )
   }
 
   return (
     <>
-      <HistoryUpdater
-        appRouterState={useUnwrapState(reducerState)}
-        sync={sync}
-      />
+      <HistoryUpdater appRouterState={useUnwrapState(state)} />
       <RuntimeStyles />
       <PathParamsContext.Provider value={pathParams}>
         <PathnameContext.Provider value={pathname}>
@@ -641,14 +659,27 @@ function Router({
 }
 
 export default function AppRouter({
-  initialRSCPayload,
+  actionQueue,
+  globalErrorComponentAndStyles: [globalErrorComponent, globalErrorStyles],
+  assetPrefix,
 }: {
-  initialRSCPayload: InitialRSCPayload
+  actionQueue: AppRouterActionQueue
+  globalErrorComponentAndStyles: [GlobalErrorComponent, React.ReactNode]
+  assetPrefix: string
 }) {
-  const { G: globalErrorComponent, ...rest } = initialRSCPayload
+  useNavFailureHandler()
+
   return (
-    <ErrorBoundary errorComponent={globalErrorComponent}>
-      <Router initialRSCPayload={rest} />
+    <ErrorBoundary
+      // globalErrorComponent doesn't need `reset`, we do a type cast here to fit the ErrorBoundary type
+      errorComponent={globalErrorComponent as ErrorComponent}
+      errorStyles={globalErrorStyles}
+    >
+      <Router
+        actionQueue={actionQueue}
+        assetPrefix={assetPrefix}
+        globalError={[globalErrorComponent, globalErrorStyles]}
+      />
     </ErrorBoundary>
   )
 }
